@@ -52,7 +52,6 @@ class Trainer:
         dev_set = NERDataset(dev_config, tokenizer)
         test_set = NERDataset(test_config, tokenizer)
 
-        # 创建dataloader
         self.train_loader = train_set.get_loader(self.config["batch_size"], True)
         self.dev_loader = dev_set.get_loader(self.config["batch_size"], False)
         self.test_loader = test_set.get_loader(self.config["batch_size"], False)
