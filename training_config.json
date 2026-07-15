@@ -1,0 +1,18 @@
+{
+  "data_dir": "./DATA",
+  "train_file": "MSRA/train_5k.txt",
+  "dev_file": "MSRA/dev_1k.txt",
+  "test_file": "MSRA/test_1k.txt",
+  "model_name": "hfl/chinese-bert-wwm",
+  "dropout_rate": 0.2,
+  "embedding_dim": 768,
+  "max_len": 128,
+  "batch_size": 16,
+  "learning_rate": 2e-05,
+  "epochs": 30,
+  "patience": 30,
+  "seed": 42,
+  "save_path": "best_msra_wwm_v2.pth",
+  "align_type": "ignore",
+  "num_labels": 7
+}
