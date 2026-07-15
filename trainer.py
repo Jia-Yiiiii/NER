@@ -1,0 +1,220 @@
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+import json
+import torch
+import swanlab
+from torch.optim import AdamW
+from transformers import BertTokenizer
+from tqdm import tqdm
+from data import NERDataset
+from model import BertForNER
+from utils import set_seed, evaluate_ner, decode_predict
+
+class Trainer:
+    def __init__(self, config):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.config = config
+        self.num_epochs = config["epochs"]
+        self.best_f1 = 0.0
+        self.model = None
+        self.train_loader = None
+        self.dev_loader = None
+        self.test_loader = None
+        self.label2id = None
+        self.id2label = None
+        set_seed(config.get("seed", 42))
+
+    def load_data(self):
+        tokenizer = BertTokenizer.from_pretrained(self.config["model_name"])
+
+        train_config = {
+            'data_path': os.path.join(self.config["data_dir"], self.config["train_file"]),
+            'max_len': self.config["max_len"],
+            'align_type': self.config.get("align_type", "ignore")
+        }
+        dev_config = {
+            'data_path': os.path.join(self.config["data_dir"], self.config["dev_file"]),
+            'max_len': self.config["max_len"],
+            'align_type': self.config.get("align_type", "ignore")
+        }
+        test_config = {
+            'data_path': os.path.join(self.config["data_dir"], self.config["test_file"]),
+            'max_len': self.config["max_len"],
+            'align_type': self.config.get("align_type", "ignore")
+        }
+
+
+        train_set = NERDataset(train_config, tokenizer)
+        tmp = train_set.label2id
+        dev_config['label2id'] = tmp
+        test_config['label2id'] = tmp
+
+        dev_set = NERDataset(dev_config, tokenizer)
+        test_set = NERDataset(test_config, tokenizer)
+
+        # 创建dataloader
+        self.train_loader = train_set.get_loader(self.config["batch_size"], True)
+        self.dev_loader = dev_set.get_loader(self.config["batch_size"], False)
+        self.test_loader = test_set.get_loader(self.config["batch_size"], False)
+
+        self.label2id = tmp
+        self.id2label = train_set.id2label
+
+    def init_model(self):
+        self.config["num_labels"] = len(self.label2id)
+        self.model = BertForNER(self.config)
+        self.model.to(self.device)
+
+    def save_model(self):
+        save_dir = os.path.dirname(self.config["save_path"])
+        os.makedirs(save_dir, exist_ok=True)
+
+        name = os.path.basename(self.config["save_path"]).split('.')[0]
+
+        torch.save(self.model.state_dict(), self.config["save_path"])
+
+        with open(os.path.join(save_dir, name + "_config.json"), "w", encoding="utf-8") as f:
+            json.dump(self.config, f)
+
+        with open(os.path.join(save_dir, name + "_label2id.json"), "w", encoding="utf-8") as f:
+            json.dump(self.label2id, f)
+
+        tokenizer = BertTokenizer.from_pretrained(self.config["model_name"])
+        tokenizer.save_pretrained(os.path.join(save_dir, name + "_tokenizer"))
+
+    def train(self):
+        swanlab.init(
+            project="bert-ner1",
+            config={
+                "learning_rate": self.config["learning_rate"],
+                "batch_size": self.config["batch_size"],
+                "epochs": self.config["epochs"],
+                "model": self.config["model_name"],
+                "dropout_rate": self.config.get("dropout_rate", 0.1)
+            }
+        )
+        optimizer = AdamW(self.model.parameters(), lr=self.config["learning_rate"])
+
+        loss_fn = torch.nn.CrossEntropyLoss()
+
+        for epoch in range(self.num_epochs):
+            self.model.train()
+            total_loss = 0
+            count = 0
+
+            for batch in tqdm(self.train_loader, desc=f"Epoch {epoch + 1}"):
+                input_ids = batch[0].to(self.device)
+                attention_mask = batch[1].to(self.device)
+                labels = batch[2].to(self.device)
+
+                optimizer.zero_grad()
+                logits = self.model(input_ids=input_ids, attention_mask=attention_mask)
+
+                logits_flat = logits.reshape(-1, logits.size(-1))
+                labels_flat = labels.reshape(-1)
+                mask_flat = attention_mask.reshape(-1) == 1
+                flat_logits = logits_flat[mask_flat]
+                flat_labels = labels_flat[mask_flat]
+                loss_val = loss_fn(flat_logits, flat_labels)
+
+                loss_val.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+
+                total_loss = total_loss + loss_val.item()
+                count = count + 1
+
+            avg_train_loss = total_loss / count
+
+            eval_loss, eval_f1, all_labels, all_preds = self.eval()
+
+            print("第", epoch + 1, "轮 训练loss:", avg_train_loss)
+            print("验证F1:", eval_f1)
+
+            swanlab.log({
+                "train/loss": avg_train_loss,
+                "eval/loss": eval_loss,
+                "eval/f1": eval_f1,
+                "epoch": epoch + 1
+            })
+
+            if eval_f1 > self.best_f1:
+                self.best_f1 = eval_f1
+                self.save_model()
+                print("保存最佳模型", eval_f1)
+                evaluate_ner(all_labels, all_preds, plot=False)
+
+        print("best f1:", self.best_f1)
+        self.test()
+        swanlab.finish()
+
+    def eval(self):
+        self.model.eval()
+        total_loss = 0
+        count = 0
+        all_preds = []
+        all_labels = []
+        loss_fct = torch.nn.CrossEntropyLoss()
+
+        with torch.no_grad():
+            for batch in self.dev_loader:
+                input_ids = batch[0].to(self.device)
+                attention_mask = batch[1].to(self.device)
+                labels = batch[2].to(self.device)
+                logits = self.model(input_ids=input_ids, attention_mask=attention_mask)
+
+                logits_flat = logits.reshape(-1, logits.size(-1))
+                labels_flat = labels.reshape(-1)
+                mask_flat = attention_mask.reshape(-1) == 1
+                valid_logits = logits_flat[mask_flat]
+                valid_labels = labels_flat[mask_flat]
+                loss = loss_fct(valid_logits, valid_labels)
+
+                total_loss = total_loss + loss.item()
+                count = count + 1
+                preds = torch.argmax(logits, dim=-1)
+
+                batch_preds, batch_labels = decode_predict(input_ids, preds, labels, attention_mask, self.id2label)
+                all_preds.extend(batch_preds)
+                all_labels.extend(batch_labels)
+
+        avg_loss = total_loss / count
+        f1, _, _ = evaluate_ner(all_labels, all_preds, plot=False)
+
+        return avg_loss, f1, all_labels, all_preds
+
+    def test(self):
+        self.model.load_state_dict(torch.load(self.config["save_path"], map_location=self.device))
+        self.model.eval()
+        all_preds = []
+        all_labels = []
+
+        with torch.no_grad():
+            for batch in self.test_loader:
+                input_ids = batch[0].to(self.device)
+                attention_mask = batch[1].to(self.device)
+                labels = batch[2].to(self.device)
+
+                logits = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                preds = torch.argmax(logits, dim=-1)
+
+                batch_preds, batch_labels = decode_predict(input_ids, preds, labels, attention_mask, self.id2label)
+                all_preds.extend(batch_preds)
+                all_labels.extend(batch_labels)
+
+        f1, _, _ = evaluate_ner(all_labels, all_preds, plot=True, save_path="test_results.png")
+        print("测试集F1:", f1)
+        swanlab.log({"test/f1": f1})
+
+    def run(self):
+        self.load_data()
+        self.init_model()
+        self.train()
+
+
+if __name__ == "__main__":
+    with open("configs/Bert_Config_exp1.json", "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    trainer = Trainer(config)
+    trainer.run()
