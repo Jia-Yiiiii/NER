@@ -1,1 +1,21 @@
+# Python缓存
+__pycache__/
+*.pyc
 
+# 数据文件夹
+DATA/
+processed/
+
+# 模型权重
+*.pth
+
+# 日志和结果
+*.log
+*.png
+swanlog/
+
+# Tokenizer（代码自动下载）
+tokenizer/
+
+# 测试文件
+1.py
